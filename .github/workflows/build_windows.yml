@@ -1,0 +1,144 @@
+
+name: Build Windows OfflineASR
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Download source code
+        uses: actions/checkout@v4
+
+      - name: Install Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: 'x64'
+
+      - name: Download trained model from GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download model-v1 --pattern windows_model.zip --dir . --repo "$env:GITHUB_REPOSITORY"
+          if ($LASTEXITCODE -ne 0) { throw 'Model download failed' }
+
+          Expand-Archive -Path windows_model.zip -DestinationPath . -Force
+
+          foreach ($file in @('final.pt', 'train.yaml', 'units.txt', 'global_cmvn')) {
+            if (!(Test-Path "model/$file")) {
+              throw "Missing model/$file"
+            }
+          }
+
+          if ((Get-Item model/final.pt).Length -lt 100MB) {
+            throw 'Model checkpoint seems too small'
+          }
+
+      - name: Install CPU inference dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install setuptools==80.9.0 wheel
+
+          python -m pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+          if ($LASTEXITCODE -ne 0) {
+            throw 'PyTorch installation failed'
+          }
+
+          python -m pip install pyyaml sentencepiece librosa jieba langid requests tqdm imageio-ffmpeg tiktoken more-itertools soundfile
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Dependency installation failed'
+          }
+
+          python -m pip install --no-build-isolation --no-deps openai-whisper==20231117
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Whisper installation failed'
+          }
+
+          python -m pip install pyinstaller
+          if ($LASTEXITCODE -ne 0) {
+            throw 'PyInstaller installation failed'
+          }
+
+      - name: Install matching WeNet source
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/wenet-e2e/wenet.git wenet_source
+          if ($LASTEXITCODE -ne 0) {
+            throw 'WeNet clone failed'
+          }
+
+          if (Test-Path wenet_commit.txt) {
+            $commit = (Get-Content wenet_commit.txt -Raw).Trim()
+
+            if ($commit -match '^[0-9a-fA-F]{40}$') {
+              git -C wenet_source fetch --depth 1 origin $commit
+              if ($LASTEXITCODE -ne 0) {
+                throw 'WeNet commit fetch failed'
+              }
+
+              git -C wenet_source checkout --detach FETCH_HEAD
+              if ($LASTEXITCODE -ne 0) {
+                throw 'WeNet checkout failed'
+              }
+            } else {
+              throw 'wenet_commit.txt must contain a 40-character Git SHA'
+            }
+          }
+
+          python -m pip install -e ./wenet_source --no-deps
+          if ($LASTEXITCODE -ne 0) {
+            throw 'WeNet installation failed'
+          }
+
+      - name: Verify model loads on Windows CPU
+        shell: pwsh
+        run: |
+          python -c "from app import check_model_files, load_asr_model; check_model_files(); load_asr_model(); print('MODEL_LOAD_OK')"
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Model load failed on Windows'
+          }
+
+      - name: Test audio processing and attention rescoring on Windows
+        shell: pwsh
+        run: |
+          python -c "import wave,numpy as np; t=np.arange(48000)/16000; x=(np.sin(2*np.pi*440*t)*8000).astype('<i2'); f=wave.open('smoke.wav','wb'); f.setnchannels(1); f.setsampwidth(2); f.setframerate(16000); f.writeframes(x.tobytes()); f.close()"
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Failed to create test WAV'
+          }
+
+          python smoke_test.py smoke.wav
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Audio processing or decoding failed on Windows'
+          }
+
+      - name: Package Windows EXE
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onedir --windowed --name OfflineASR --collect-all wenet --collect-all whisper --collect-all imageio_ffmpeg --collect-all sentencepiece --collect-all torchaudio app.py
+          if ($LASTEXITCODE -ne 0) {
+            throw 'PyInstaller failed'
+          }
+
+          New-Item -ItemType Directory -Force dist/OfflineASR/model | Out-Null
+          Copy-Item model/* dist/OfflineASR/model/ -Force
+
+          if (!(Test-Path dist/OfflineASR/OfflineASR.exe)) {
+            throw 'EXE not created'
+          }
+
+      - name: Upload Windows application
+        uses: actions/upload-artifact@v4
+        with:
+          name: OfflineASR_Windows
+          path: dist/OfflineASR/
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 7
